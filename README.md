@@ -1,69 +1,108 @@
-1) What “normal” KernelSHAP does (for an image)
+# Prior-Guided KernelSHAP for Images (CIFAR-10, ResNet-18)
 
-Think of a 32×32 image as 1024 binary features (each pixel can be ON = original, or OFF = replaced by a baseline like the average image E_hwc).
+This repo explores a **faster approximation of KernelSHAP** for image models by using a **prior heatmap** (Grad-CAM++ / DeepLIFT) to reduce the feature space before running KernelSHAP.
 
-To explain the model’s score for one class (we use the class logit), KernelSHAP:
+✅ **Main idea:** KernelSHAP over all pixels is expensive (1024 features → huge coalition space).  
+🚀 We speed it up by **first using a prior** to pick **top-k “important” features** (pixels or superpixels), and then running **KernelSHAP only on those k features** while keeping everything else fixed to the original image.
 
-Samples coalitions of pixels (which pixels are ON vs OFF).
+---
 
-Builds masked images for those coalitions: image(mask) = mask * image + (1 - mask) * baseline.
+## What “normal” KernelSHAP does (for an image)
 
-Evaluates the model on each masked image to get a score.
+A 32×32 image has **1024 pixel locations**. In classic KernelSHAP we treat each pixel location as a feature:
 
-Solves a weighted least squares (WLS) problem to assign a Shapley value to each pixel, so that the sum of all pixel values roughly matches f(full image) − f(baseline).
+- **ON (1):** keep the original pixel  
+- **OFF (0):** replace it with a baseline value (we use the mean CIFAR-10 image `E_hwc`)
 
-This is faithful but expensive when you have 1024 features.
+KernelSHAP then:
 
-2) Our fast idea: use a prior to shrink the feature space
+1. **Samples coalitions** (binary masks of which pixels are ON vs OFF).
+2. Builds masked images:  
+   `composite = mask * image + (1 - mask) * baseline`
+3. Runs the model on each masked image to get a **score** (here: **logit of predicted class**).
+4. Solves a **Weighted Least Squares (WLS)** regression using Shapley kernel weights to estimate **Shapley values** per pixel.
+5. Enforces additivity (approximately):  
+   `sum(phi) ≈ f(full_image) - f(baseline)`
 
-We keep the same SHAP logic, but we don’t let all 1024 pixels vary. Instead, we:
+**Accurate but slow** because the feature space is large (1024 features).
 
-Run a quick attribution method on the full image, like Grad-CAM++ (or DeepLIFT).
-This gives a heatmap telling us which areas look important.
+---
 
-Pick the top-k pixels (or top-k SLIC superpixels) based on that heatmap.
-These are the only features we’ll toggle in the SHAP game.
+## Our faster method: prior-guided Top-k KernelSHAP
 
-Fix all other pixels to be as in the original image (always ON).
-Only the selected top-k are switched ON/OFF against the baseline during SHAP sampling.
+We keep the KernelSHAP idea, but **we do not let all 1024 pixels vary**.
 
-Run KernelSHAP on this k-feature game:
+Instead:
 
-background = all k OFF (baseline on those k),
+1. Run a fast attribution method (**Grad-CAM++** or **DeepLIFT**) on the full image → produces a **heatmap**.
+2. Use the heatmap to **select top-k** pixels (or top-k **SLIC superpixels**).
+3. Run KernelSHAP only on those **k selected features**.
 
-x_full = all k ON (original on those k),
+### Fixed-context game (important detail)
 
-sample coalitions among the k features and solve WLS to get k Shapley values.
+- Selected features **S (size k)** toggle between baseline and original depending on coalition mask.
+- Non-selected features **Sᶜ** are always kept as **original** (never toggled).
 
-Scatter back the k values to the 1024 grid (pixels not in top-k get 0).
+So the SHAP game becomes: “What do the top-k features contribute **given that everything else stays fixed to the original image**?”
 
-This makes SHAP much faster because we solve a k-dimensional problem (k ≪ 1024).
+---
 
-3) The logic behind this
+## Side-by-side pipeline (Normal vs Prior-Guided)
 
-Full KernelSHAP is slow because there are many features (1024) and many possible coalitions.
+> Tip: GitHub renders this table correctly. If you paste into an editor that doesn't support Markdown tables, paste into GitHub directly (README.md) or a Markdown editor.
 
-A fast prior (Grad-CAM++ or DeepLIFT) is cheap and gives a reasonable guess about where the action is.
+| Stage | Normal KernelSHAP (1024 pixels) | Prior-Guided KernelSHAP (Top-k) |
+|---|---|---|
+| Feature space | 1024 pixels (binary ON/OFF) | k features (pixels or superpixels) |
+| Uses a prior heatmap? | No | Yes (Grad-CAM++ / DeepLIFT) |
+| What toggles in coalitions | Any of the 1024 pixels | Only selected top-k toggle |
+| What stays fixed | Nothing (all pixels may change) | Non-selected pixels always original |
+| Masked image construction | `m ⊙ x + (1−m) ⊙ E_hwc` | Same idea, but `m` only controls selected features |
+| Model score | Predicted-class logit | Predicted-class logit |
+| Regression | WLS over 1024-D masks | WLS over k-D masks |
+| Output φ | 1024 SHAP values | k SHAP values, scattered back (others = 0) |
+| Compute cost | High | Much lower (k ≪ 1024) |
+| Risk / limitation | — | May miss interactions outside top-k |
 
-By only letting those k important features vary, we can compute Shapley values quickly while still capturing most of the explanation signal.
+---
 
-4) What this does not guarantee
+## Why the prior approach can fail sometimes (important)
 
-A pixel that looks “unimportant” alone (and got excluded) might become important in combination with some selected pixels.
-Because we fixed non-selected pixels to “original,” we don’t see coalitions that would have toggled them.
+Even if a pixel looks “unimportant” by itself (low heatmap score), it can become important **when combined with other pixels**.
 
-So this approach is an approximation: fast and often good, but not perfect.
+Example intuition:
 
-5) Practical tips (plain English)
+- Pixel A alone: not important  
+- Pixel B alone: not important  
+- **A + B together:** very important (interaction)
 
-Choose k first. Small k = faster but may miss interactions; very large k = closer to full SHAP but can get unstable/slow.
-Try a few values (e.g., 300, 600, 900) and see which gives stable, sensible maps.
+If either A or B was not included in top-k, that coalition is never explored.
 
-nsamples (number of coalitions you sample) helps solve the chosen k-game better, but won’t fix a bad k.
-After a point, more nsamples gives little extra benefit.
+✅ This method is often good and much faster  
+❌ But it is **not guaranteed** to match full KernelSHAP
 
-If you can, try superpixels (SLIC) instead of raw pixels—grouped regions often behave more naturally and reduce artifacts.
+---
 
-6) One-paragraph summary
+## Practical tips
 
-Normal KernelSHAP randomly toggles all 1024 pixels and solves a regression to assign each pixel a contribution, but it’s slow. Our method first gets a heatmap prior (Grad-CAM++/DeepLIFT), keeps only the top-k pixels (or superpixels) as features, fixes everything else to the original image, and then runs KernelSHAP just on those k features. It’s the same SHAP machinery, just on a smaller, prior-guided feature set. It’s faster and usually good—but it can miss coalitions involving features we didn’t select.
+- **Tune `k` first**:
+  - smaller k = faster but can miss interactions
+  - larger k = closer to full SHAP, but can become unstable / slow
+  - try `k = 300, 600, 900` and check stability
+
+- **Then tune `nsamples`**:
+  - increases coalition sampling inside the chosen k-game
+  - helps until diminishing returns
+
+- **Try superpixels (SLIC)**:
+  - groups pixels into meaningful regions
+  - reduces off-manifold artifacts from masking single pixels
+  - reduces effective feature count
+
+---
+
+## One-paragraph summary
+
+Normal KernelSHAP toggles all 1024 pixels to sample coalitions and solve a WLS regression to assign Shapley values, but it’s slow. Our method first computes a fast heatmap prior (Grad-CAM++ or DeepLIFT), keeps only the top-k pixels (or superpixels) as features, fixes the rest of the image to its original values, and then runs KernelSHAP only on those k features. It is much faster and often captures the main explanation signal, but it can miss important coalitions involving features that were not selected.
+
+---
